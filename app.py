@@ -260,198 +260,7 @@ VENUE_RATING_MAP = {
 
 # --- 2. MODEL & DATA LOADING (Cached) ---
 
-@st.cache_resource
-def load_model(model_path):
-    """Loads the trained model pipeline from disk."""
-    try:
-        model = joblib.load(model_path)
-        print(f"Model '{model_path}' loaded successfully.")
-        return model
-    except FileNotFoundError:
-        st.error(f"FATAL: Model file '{model_path}' not found. Please train your 7-feature model and save it to this folder.")
-        print(f"Error: Model file '{model_path}' not found.")
-        return None
-    except Exception as e:
-        st.error(f"Error loading model: {e}")
-        print(f"Error loading model: {e}")
-        return None
-
-@st.cache_data(ttl=60) # Cache the list of matches for 60 seconds
-def fetch_live_match_list() -> List[Dict[str, Any]]:
-    """Fetches the list of all currently live matches."""
-    url = f"{BASE_URL}/currentMatches"
-    params = {"apikey": API_KEY, "offset": 0}
-    try:
-        resp = requests.get(url, params=params, timeout=10)
-        resp.raise_for_status()
-        data = resp.json().get('data', [])
-        
-        # Filter for T20 matches that have started
-        live_t20_matches = [
-            match for match in data
-            if match.get('matchType') == 't20' and match.get('matchStarted')
-        ]
-        return live_t20_matches
-    except requests.exceptions.RequestException as e:
-        st.error(f"API Error fetching match list: {e}")
-        return []
-
-def fetch_live_score(match_id: str) -> Optional[Dict[str, Any]]:
-    """Fetches the detailed score for a single match. NOT cached."""
-    # Using 'match_score' endpoint for detailed ball-by-ball (if bbbEnabled)
-    # or at least detailed scorecards.
-    url = f"{BASE_URL}/match_score"
-    params = {"apikey": API_KEY, "id": match_id}
-    try:
-        resp = requests.get(url, params=params, timeout=10)
-        resp.raise_for_status()
-        return resp.json().get('data')
-    except requests.exceptions.RequestException as e:
-        # Don't show an error on the UI, as it will pop up on every refresh
-        print(f"Error fetching score (will retry): {e}")
-        return None
-
-# --- 3. DATA PARSING & FEATURE ENGINEERING ---
-
-def parse_live_data(score_data: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Parses the full API score data into the 7 features and UI stats.
-    Returns a dictionary with:
-    - 'status': "WAITING", "IN_PLAY", or "COMPLETE"
-    - 'model_input': A DataFrame for the model (if in_play)
-    - 'stats': A dictionary of rich stats for the UI
-    """
-    try:
-        scores = score_data.get('score', [])
-        venue = score_data.get('venue', 'Unknown Venue')
-        teams = score_data.get('teams', ['Team 1', 'Team 2'])
-        
-        # --- Get Team Names ---
-        team1_name = teams[0]
-        team2_name = teams[1]
-        
-        # --- Check Match State ---
-        if not scores or len(scores) == 0:
-            return {"status": "WAITING", "stats": {"message": "Match has not started."}}
-        
-        if score_data.get('matchEnded'):
-            return {"status": "COMPLETE", "stats": {"message": score_data.get('status', 'Match Ended')}}
-
-        # --- Innings 1 in Progress ---
-        if len(scores) == 1:
-            inn1 = scores[0]
-            # Figure out who is batting
-            batting_team_name = team1_name if inn1['inning'].startswith(team1_name) else team2_name
-            bowling_team_name = team2_name if batting_team_name == team1_name else team1_name
-            
-            stats = {
-                "message": "Innings 1 in progress. Waiting for chase to begin.",
-                "batting_team": batting_team_name,
-                "bowling_team": bowling_team_name,
-                "score_str": f"{inn1['r']}/{inn1['w']} ({inn1['o']})",
-                "venue": venue
-            }
-            return {"status": "WAITING", "stats": stats}
-
-        # --- Innings 2 in Progress (The main logic) ---
-        if len(scores) >= 2:
-            inn1 = scores[0]
-            inn2 = scores[1]
-            
-            # Identify batting and bowling teams
-            # The chasing team is the one *not* batting in innings 1
-            team1_bat_first = inn1['inning'].startswith(team1_name)
-            batting_team_name = team2_name if team1_bat_first else team1_name
-            bowling_team_name = team1_name if team1_bat_first else team2_name
-
-            # --- Calculate Model Features ---
-            target = inn1['r'] + 1
-            current_runs = inn2['r']
-            current_wickets = inn2['w']
-            current_overs_float = inn2['o']
-            
-            runs_required = target - current_runs
-            wickets_remaining = 10 - current_wickets
-            
-            total_balls = 120
-            overs_int = int(current_overs_float)
-            balls_in_over = int(round((current_overs_float - overs_int) * 10))
-            balls_bowled = (overs_int * 6) + balls_in_over
-            
-            balls_left = total_balls - balls_bowled
-            
-            if balls_left <= 0 or wickets_remaining <= 0 or runs_required <= 0:
-                return {"status": "COMPLETE", "stats": {"message": score_data.get('status', 'Match Ended')}}
-
-            current_run_rate = (current_runs * 6) / balls_bowled if balls_bowled > 0 else 0
-            required_run_rate = (runs_required * 6) / balls_left if balls_left > 0 else float('inf')
-            
-            venue_rating = VENUE_RATING_MAP.get(venue, VENUE_RATING_MAP['default'])
-
-            # Create the 7-feature DataFrame for the model
-            model_input_df = pd.DataFrame([{
-                "balls_left": balls_left,
-                "runs_required": runs_required,
-                "wickets_remaining": wickets_remaining,
-                "current_run_rate": current_run_rate,
-                "required_run_rate": required_run_rate,
-                "venue_rating": venue_rating,
-                "current_wickets": current_wickets
-            }])
-            
-            # Create rich stats for the UI
-            stats = {
-                "message": score_data.get('status', 'Match in Progress'),
-                "batting_team": batting_team_name,
-                "bowling_team": bowling_team_name,
-                "target": target,
-                "score_str": f"{current_runs}/{current_wickets} ({current_overs_float})",
-                "runs_required": runs_required,
-                "balls_left": balls_left,
-                "wickets_remaining": wickets_remaining,
-                "current_run_rate": f"{current_run_rate:.2f}",
-                "required_run_rate": f"{required_run_rate:.2f}",
-                "venue": venue
-            }
-            
-            return {"status": "IN_PLAY", "model_input": model_input_df, "stats": stats}
-            
-        return {"status": "WAITING", "stats": {"message": "Waiting for match data..."}}
-
-    except Exception as e:
-        print(f"Error in parse_live_data: {e}")
-        return {"status": "ERROR", "stats": {"message": f"An error occurred: {e}"}}
-
-# --- 4. STREAMLIT UI ---
-
-st.set_page_config(page_title="T20 Win Predictor", layout="wide")
-model = load_model(MODEL_PATH)
-
-# --- VIEW 1: MATCH SELECTION (HOME PAGE) ---
-# We use session_state to manage which page the user is on.
-if 'selected_match_id' not in st.session_state:
-    st.session_state.selected_match_id = None
-
-if st.session_state.selected_match_id is None:
-    st.title("Live T20 Match Selector")
-    
-    match_list = fetch_live_match_list()
-    
-    if not match_list:
-        st.warning("No live T20 matches found. Please check API key or try again later.")
-    else:
-        # Create a dictionary of 'Match Name' -> 'match_id'
-        match_options = {match['name']: match['id'] for match in match_list}
-        
-        selected_match_name = st.selectbox(
-            "Select a live T20 match to track:",
-            options=match_options.keys()
-        )
-        
-        if st.button("Start Prediction Dashboard"):
-            st.session_state.selected_match_id = match_options[selected_match_name]
-            st.session_state.match_name = selected_match_name # Store name for display
-            st.rerun() # Re-run the script to load the dashboard view
+# ... (Keep your imports and View 1 code the same) ...
 
 # --- VIEW 2: LIVE PREDICTION DASHBOARD ---
 else:
@@ -468,18 +277,40 @@ else:
             st.rerun()
             
         # --- Auto-Refreshing Dashboard ---
-        # Create a placeholder that the loop will overwrite
         placeholder = st.empty()
         
-        # Loop indefinitely to auto-refresh
         while st.session_state.selected_match_id:
             
-            # Fetch the latest score data
-            score_data = fetch_live_score(st.session_state.selected_match_id)
+            # ---------------------------------------------------------
+            # CORRECT FETCHING LOGIC START
+            # We fetch the entire list again because 'match_score' endpoint 
+            # is often restricted. We find our match inside this list.
+            # ---------------------------------------------------------
+            score_data = None
+            try:
+                # Use the SAME endpoint that worked for the dropdown
+                url = f"{BASE_URL}/currentMatches"
+                params = {"apikey": API_KEY, "offset": 0}
+                resp = requests.get(url, params=params, timeout=10)
+                resp.raise_for_status()
+                all_matches = resp.json().get('data', [])
+                
+                # Find our specific match in the list by ID
+                for match in all_matches:
+                    if match.get('id') == st.session_state.selected_match_id:
+                        score_data = match
+                        break
+            except Exception as e:
+                print(f"Error fetching data: {e}") # Check your terminal for this!
+            # ---------------------------------------------------------
+            # CORRECT FETCHING LOGIC END
+            # ---------------------------------------------------------
             
             if not score_data:
                 with placeholder.container():
                     st.warning("Fetching live score... (Will retry in 20s)")
+                    # Debugging help:
+                    st.caption("Check your terminal/console logs for error details.")
                 time.sleep(REFRESH_INTERVAL_SECONDS)
                 continue
 
@@ -498,7 +329,6 @@ else:
                 if "batting_team" in stats:
                     st.text(f"Venue: {stats.get('venue')}")
                     
-                    # Use columns for a clean layout
                     cols = st.columns(4)
                     cols[0].metric("Chasing Team", stats.get('batting_team', 'N/A'))
                     cols[1].metric("Current Score", stats.get('score_str', 'N/A'))
@@ -510,24 +340,18 @@ else:
                 st.header("Win Probability")
 
                 if status == "IN_PLAY":
-                    # Get model input
                     model_input_df = parsed_data['model_input']
-                    
-                    # Get probabilities from the model
                     probabilities = model.predict_proba(model_input_df)
-                    win_prob = probabilities[0][1] # Probability of Class 1 (Win)
-                    loss_prob = probabilities[0][0] # Probability of Class 0 (Loss)
+                    win_prob = probabilities[0][1]
+                    loss_prob = probabilities[0][0]
 
-                    # Create data for the horizontal bar chart
                     prob_df = pd.DataFrame({
                         "Team": [stats['batting_team'], stats['bowling_team']],
                         "Win Probability": [win_prob, loss_prob]
                     }).set_index("Team")
                     
-                    # Display the bar chart
                     st.bar_chart(prob_df, horizontal=True)
 
-                    # --- C. Display Key Predictive Factors (The "Insights") ---
                     st.subheader("Key Predictive Factors")
                     cols = st.columns(4)
                     cols[0].metric("Runs Required", stats.get('runs_required', 'N/A'))
@@ -536,23 +360,15 @@ else:
                     cols[3].metric("Required Run Rate", stats.get('required_run_rate', 'N/A'))
                     
                 elif status == "WAITING":
-                    # This fulfills your requirement for "Chasing Team yet to bat"
                     st.info(stats.get("message", "Waiting for match to enter 2nd innings."))
                 
                 elif status == "COMPLETE":
                     st.success(stats.get("message", "Match has ended."))
-                    st.text("Dashboard will stop auto-refreshing.")
-                    st.session_state.selected_match_id = None # Stop the loop
+                    st.session_state.selected_match_id = None 
                 
-                elif status == "ERROR":
-                    st.error(stats.get("message", "An error occurred."))
-                    st.text("Dashboard will stop.")
-                    st.session_state.selected_match_id = None # Stop the loop
-                
-                # Only show refresh timer if the loop is still active
                 if st.session_state.selected_match_id:
                     st.text(f"Refreshing in {REFRESH_INTERVAL_SECONDS} seconds...")
             
-            # Wait before the next loop iteration
             time.sleep(REFRESH_INTERVAL_SECONDS)
+
 
