@@ -9,7 +9,7 @@ from typing import Dict, Any, List, Optional, Tuple
 
 # IMPORTANT: This MUST be the path to your new model trained on ONLY the 7 features.
 MODEL_PATH = "live_model_7features.joblib" 
-API_KEY = "2f80cbd3-73d4-4823-be9a-2af40b6ba3a8" # Your CricAPI key
+API_KEY = "907eef2c-c869-43d0-ada8-fb17eba1b199" # Your CricAPI key
 BASE_URL = "https://api.cricapi.com/v1"
 REFRESH_INTERVAL_SECONDS = 20 # How often to refresh live data
 
@@ -555,3 +555,4 @@ else:
             
             # Wait before the next loop iteration
             time.sleep(REFRESH_INTERVAL_SECONDS)
+
