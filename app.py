@@ -8,7 +8,7 @@ from typing import Dict, Any, List
 # --- 1. CONFIGURATION ---
 
 MODEL_PATH = "live_model_7features.joblib" 
-API_KEY = "2f80cbd3-73d4-4823-be9a-2af40b6ba3a8"
+API_KEY = "907eef2c-c869-43d0-ada8-fb17eba1b199"
 BASE_URL = "https://api.cricapi.com/v1"
 REFRESH_INTERVAL_SECONDS = 20
 
@@ -370,6 +370,7 @@ else:
                 st.text(f"Next update in {REFRESH_INTERVAL_SECONDS}s...")
             
             time.sleep(REFRESH_INTERVAL_SECONDS)
+
 
 
 
